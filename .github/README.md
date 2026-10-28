@@ -20,6 +20,9 @@ Upstream's own README is [`/README.md`](../README.md).
   distro with the target's exact CUDA toolkit, **SASS-only for its GPU arch** (`86-real`: no PTX, no JIT), and
   ggml-cpu's `-march=native` replaced by the flags gcc resolves for `-march=native` *on the target CPU*.
   The result matches running `make build` on that box.
+- **Fast rebuilds:** the toolchain half (distro, CUDA, gcc: ~2 min) only depends on the profile; the
+  compile (~20 min cold) runs through **ccache** kept across runs, so an upstream commit recompiles only what
+  it touched.
 - **No GPU in CI.** Checks: upstream `make test` (front end vs. fake engine), nvcc version == target's,
   device code is exactly the target SASS, no unresolved libs except the driver's `libcuda.so.1`, glibc
   floor ≤ target's, `--help` smoke runs (best effort).

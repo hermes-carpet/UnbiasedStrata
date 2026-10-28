@@ -12,6 +12,12 @@
 #   - any failure opens (or comments on) one issue labelled `auto-build`, like the
 #     presenton fork's upstream-sync; the next green run closes it.
 #
+# Two halves per target, split by how often they change: setup-toolchain.sh (distro, CUDA,
+# gcc, CPU wrapper -- only the profile changes it) and the compile of upstream's commit,
+# with ccache carried across runs and keyed on a hash of the toolchain inputs. Measured
+# first run: toolchain ~2 min, compile ~20 min, make test ~4.5 min -- so the cache that
+# matters is ccache (a prebuilt toolchain image would save ~1.5 min and cost a 3 GB pull).
+#
 # A target = one .github/targets/<name>.env file (written on the target box by
 # .github/scripts/scrape-target.sh). Each is built in a container of the target's distro
 # with the target's exact CUDA toolkit, its GPU arch as SASS only (no PTX: nothing is
@@ -128,6 +134,9 @@ jobs:
           git commit -m "keepalive: upstream quiet for ${age} days"
           git push
 
+  # setup-toolchain.sh (distro + CUDA + gcc + CPU wrapper; ~2 min, changes only with the
+  # profile) then the compile, with ccache kept across runs by actions/cache, keyed on the
+  # toolchain hash: an upstream commit recompiles only what it touched.
   build:
     needs: check
     if: needs.check.outputs.changed == 'true'
@@ -143,6 +152,19 @@ jobs:
       LABEL: ${{ needs.check.outputs.label }}
     steps:
       - uses: actions/checkout@v6
+
+      - name: ccache key (target + toolchain hash)
+        id: tc
+        run: |
+          ref=$(bash .github/ci/toolchain-tag.sh "${{ matrix.target.file }}")
+          echo "key=ccache-${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ${{ steps.tc.outputs.key }}-${{ env.BUILD_SHA }}
+          restore-keys: ${{ steps.tc.outputs.key }}-
 
       - name: Free runner disk (the CUDA toolkit + build need ~20 GB)
         run: |
@@ -162,12 +184,20 @@ jobs:
           git submodule update --init --depth 1
           echo "upstream $(git rev-parse HEAD); llama.cpp $(git -C third_party/llama.cpp rev-parse HEAD)"
 
-      - name: Build + check + package in ${{ matrix.target.image }}
+      - name: Toolchain + build + check + package in ${{ matrix.target.image }}
         run: |
-          docker run --rm -v "$PWD:/w" -w /w -e JOBS=4 "${{ matrix.target.image }}" \
+          mkdir -p .ccache
+          docker run --rm -v "$PWD:/w" -w /w -e JOBS=4 -e CCACHE_DIR=/w/.ccache "${{ matrix.target.image }}" \
             bash .github/ci/build-in-container.sh "${{ matrix.target.file }}" /w/upstream /w/dist "$LABEL"
-          sudo chown -R "$(id -u)" dist
+          sudo chown -R "$(id -u)" dist .ccache
           grep -v '^WARN' "dist/checks-${{ matrix.target.name }}.txt" | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ${{ steps.tc.outputs.key }}-${{ env.BUILD_SHA }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -273,7 +303,7 @@ jobs:
 
   report-failure:
     needs: [check, build, publish]
-    if: always() && (needs.check.result == 'failure' || needs.build.result == 'failure' || needs.publish.result == 'failure')
+    if: always() && contains(needs.*.result, 'failure')
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
