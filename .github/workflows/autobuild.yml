@@ -198,8 +198,10 @@ jobs:
       LABEL: ${{ needs.check.outputs.label }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      # latest main, not the run's start commit: main may have moved during a long build
       - uses: actions/checkout@v6
         with:
+          ref: main
           fetch-depth: 0
 
       - uses: actions/download-artifact@v4

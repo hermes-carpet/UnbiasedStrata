@@ -68,7 +68,10 @@ esac
 NVCC=$(command -v nvcc)
 nvcc_rel=$(nvcc --version | sed -nE 's/.*, V([0-9.]+)$/\1/p')
 note "nvcc: $NVCC  V${nvcc_rel}  (target has ${CUDA_VERSION})"
-if [ "$nvcc_rel" != "$CUDA_VERSION" ]; then
+# full release (12.4.131) = the target's own toolkit, must match exactly; X.Y = driver-only
+# target, any patch of X.Y
+case "$nvcc_rel" in "$CUDA_VERSION"|"$CUDA_VERSION".*) ok=1 ;; *) ok=0 ;; esac
+if [ "$ok" != 1 ]; then
   echo "::error::CI nvcc is V${nvcc_rel} but the target has ${CUDA_VERSION} -- refusing to build a mismatched binary"
   exit 1
 fi

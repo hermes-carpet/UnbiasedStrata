@@ -12,27 +12,43 @@
 set -euo pipefail
 
 REPO=hermes-carpet/UnbiasedStrata
-NAME=""; DRY=0
-for a in "$@"; do case "$a" in --dry-run) DRY=1 ;; *) NAME=$a ;; esac; done
-NAME=${NAME:-$(hostname -s)}
+TNAME=""; DRY=0
+for a in "$@"; do case "$a" in --dry-run) DRY=1 ;; *) TNAME=$a ;; esac; done
+TNAME=${TNAME:-$(hostname -s)}
 die() { echo "error: $*" >&2; exit 1; }
 
 [ "$(uname -m)" = x86_64 ] || die "only x86_64 targets are supported (this is $(uname -m))"
 . /etc/os-release
 
+command -v nvidia-smi >/dev/null || die "nvidia-smi not found (no NVIDIA driver?)"
+
 # --- CUDA toolkit: version and source --------------------------------------------------
+# With a toolkit on the box: build against exactly that nvcc release. Without one (driver
+# only): the newest toolkit NVIDIA's apt repo has for this distro that the driver can run;
+# the box then uses the -cudalibs package (CUDA runtime libs bundled).
 NVCC=$(command -v nvcc || true)
 [ -n "$NVCC" ] || for p in /usr/local/cuda/bin/nvcc /usr/local/cuda-*/bin/nvcc; do [ -x "$p" ] && NVCC=$p && break; done
-[ -n "$NVCC" ] || die "nvcc not found: install the CUDA toolkit the binaries should link against"
-CUDA_VERSION=$("$NVCC" --version | sed -nE 's/.*, V([0-9.]+)$/\1/p')
-real_nvcc=$(readlink -f "$NVCC")
-if dpkg -S "$real_nvcc" 2>/dev/null | grep -q '^nvidia-cuda-toolkit'; then CUDA_SOURCE=debian-apt
-elif dpkg -S "$real_nvcc" 2>/dev/null | grep -q '^cuda-nvcc'; then CUDA_SOURCE=nvidia-repo
-else CUDA_SOURCE=nvidia-repo; echo "note: nvcc ($real_nvcc) is not from a .deb (runfile install?); CI will use NVIDIA's apt repo for ${CUDA_VERSION}" >&2
+if [ -n "$NVCC" ]; then
+  CUDA_ON_TARGET=yes
+  CUDA_VERSION=$("$NVCC" --version | sed -nE 's/.*, V([0-9.]+)$/\1/p')
+  real_nvcc=$(readlink -f "$NVCC")
+  if dpkg -S "$real_nvcc" 2>/dev/null | grep -q '^nvidia-cuda-toolkit'; then CUDA_SOURCE=debian-apt
+  elif dpkg -S "$real_nvcc" 2>/dev/null | grep -q '^cuda-nvcc'; then CUDA_SOURCE=nvidia-repo
+  else CUDA_SOURCE=nvidia-repo; echo "note: nvcc ($real_nvcc) is not from a .deb (runfile install?); CI will use NVIDIA's apt repo for ${CUDA_VERSION}" >&2
+  fi
+else
+  CUDA_ON_TARGET=no CUDA_SOURCE=nvidia-repo
+  drv_cuda=$(nvidia-smi -q | sed -nE 's/^ *CUDA (UMD )?Version *: *([0-9]+\.[0-9]+).*/\2/p' | tail -1)
+  [ -n "$drv_cuda" ] || die "no nvcc, and nvidia-smi does not report the driver's CUDA version"
+  repo="${ID}$(echo "$VERSION_ID" | tr -d .)"
+  CUDA_VERSION=$(curl -fsSL "https://developer.download.nvidia.com/compute/cuda/repos/${repo}/x86_64/Packages.gz" 2>/dev/null \
+    | gunzip | sed -nE 's/^Package: cuda-nvcc-([0-9]+)-([0-9]+)$/\1.\2/p' | sort -uV \
+    | awk -v d="$drv_cuda" '{ split($0,a,"."); split(d,b,"."); if (a[1]<b[1] || (a[1]==b[1] && a[2]<=b[2])) v=$0 } END { print v }' || true)
+  [ -n "$CUDA_VERSION" ] || die "no nvcc here and no CUDA <= ${drv_cuda} in NVIDIA's ${repo} repo"
+  echo "note: no CUDA toolkit on this box; driver supports CUDA ${drv_cuda}; CI will build with NVIDIA's ${CUDA_VERSION} (use the -cudalibs package)" >&2
 fi
 
 # --- GPUs ---------------------------------------------------------------------------------
-command -v nvidia-smi >/dev/null || die "nvidia-smi not found (no NVIDIA driver?)"
 gpu_rows=$(nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader)
 DRIVER=$(head -1 <<<"$gpu_rows" | awk -F', ' '{print $3}')
 GPUS=$(awk -F', ' '{gsub(/\./,"",$2); print $1" (sm_"$2")"}' <<<"$gpu_rows" | sort | uniq -c | sed -E 's/^ *([0-9]+) /\1x /' | paste -sd ';' | sed 's/;/; /g')
@@ -40,20 +56,30 @@ CUDA_ARCHS=$(awk -F', ' '{gsub(/\./,"",$2); print $2"-real"}' <<<"$gpu_rows" | s
 
 # --- host compiler: the newest gcc this nvcc accepts (same probe as upstream's Makefile) ---
 HOST_GCC=""
-t=$(mktemp /tmp/scrape-XXXXXX.cu); printf 'int main(){return 0;}\n' > "$t"
-for v in 15 14 13 12 11; do
-  c=$(command -v "g++-$v" || true); [ -n "$c" ] || continue
-  if "$NVCC" -ccbin "$c" -c "$t" -o /dev/null >/dev/null 2>&1; then HOST_GCC=$v; break; fi
-done
-rm -f "$t"
-[ -n "$HOST_GCC" ] || die "no g++-NN that $NVCC accepts (CUDA 12.4 needs g++-13 or older: apt install g++-13)"
+if [ -n "$NVCC" ]; then
+  t=$(mktemp /tmp/scrape-XXXXXX.cu); printf 'int main(){return 0;}\n' > "$t"
+  for v in 15 14 13 12 11; do
+    c=$(command -v "g++-$v" || true); [ -n "$c" ] || continue
+    if "$NVCC" -ccbin "$c" -c "$t" -o /dev/null >/dev/null 2>&1; then HOST_GCC=$v; break; fi
+  done
+  rm -f "$t"
+  [ -n "$HOST_GCC" ] || die "no g++-NN that $NVCC accepts (CUDA 12.4 needs g++-13 or older: apt install g++-13)"
+else
+  # only CI compiles; pick a gcc that toolkit accepts (12.x: <= 13, 13.x: <= 15)
+  case "$CUDA_VERSION" in 12.*) HOST_GCC=13 ;; *) HOST_GCC=14 ;; esac
+fi
 
-# --- CPU: what -march=native means here, resolved by that same gcc ------------------------
-gcc_bin=$(command -v "gcc-$HOST_GCC")
+# --- CPU: what -march=native means here, resolved by that gcc (or the nearest one here) ---
+gcc_bin=$(command -v "gcc-$HOST_GCC" || command -v gcc-14 || command -v gcc-13 || command -v gcc || true)
+[ -n "$gcc_bin" ] || die "no gcc on this box to resolve -march=native (apt install gcc)"
 CPU_MODEL=$(sed -nE 's/^model name\s*:\s*//p' /proc/cpuinfo | head -1)
-cc1=$("$gcc_bin" -march=native -E -v - </dev/null 2>&1 | grep -m1 '/cc1 ')
-CPU_MARCH=$(grep -oE -- '-march=[^ ]+' <<<"$cc1" | head -1 | cut -d= -f2)
-CPU_FLAGS=$(tr ' ' '\n' <<<"$cc1" | grep -E -- '^-m(arch|tune|[a-z0-9])|^--param=' | grep -v -- '^-mtune=generic$' | paste -sd ' ')
+# capture all of gcc's output first: grep -m1 in a pipe would SIGPIPE gcc (exit 2 under pipefail)
+gcc_v=$("$gcc_bin" -march=native -E -v - </dev/null 2>&1 || true)
+cc1=$(printf '%s\n' "$gcc_v" | { grep '/cc1 ' || true; } | sed -n 1p)
+CPU_MARCH=$(printf '%s\n' "$cc1" | tr ' ' '\n' | sed -n 's/^-march=//p' | sed -n 1p)
+# keep -march/-mtune/-m<isa>/-mno-<isa> and the cache --params (cc1 prints "--param k=v")
+CPU_FLAGS=$(printf '%s\n' "$cc1" | sed 's/--param /--param=/g' | tr ' ' '\n' \
+  | { grep -E -- '^-m(arch|tune|[a-z0-9])|^--param=' || true; } | { grep -v -- '^-mtune=generic$' || true; } | paste -sd ' ')
 [ -n "$CPU_MARCH" ] || die "could not resolve -march=native with $gcc_bin"
 
 GLIBC=$(getconf GNU_LIBC_VERSION | awk '{print $2}')
@@ -63,11 +89,12 @@ profile=$(mktemp /tmp/target-XXXXXX.env)
 trap 'rm -f "$profile"' EXIT
 cat > "$profile" <<EOF
 # Build target profile, scraped on $(hostname -s) by .github/scripts/scrape-target.sh.
-TARGET_NAME='$NAME'
+TARGET_NAME='$TNAME'
 SCRAPED='$(date -u +%FT%TZ) on $(hostname -s)'
 IMAGE='$IMAGE'
 CUDA_SOURCE='$CUDA_SOURCE'
 CUDA_VERSION='$CUDA_VERSION'
+CUDA_ON_TARGET='$CUDA_ON_TARGET'
 CUDA_ARCHS='$CUDA_ARCHS'
 HOST_GCC='$HOST_GCC'
 GPUS='$GPUS'
@@ -78,7 +105,7 @@ CPU_MODEL='$CPU_MODEL'
 CPU_MARCH='$CPU_MARCH'
 CPU_FLAGS='$CPU_FLAGS'
 EOF
-echo "=== profile for target '$NAME' ==="; cat "$profile"; echo
+echo "=== profile for target '$TNAME' ==="; cat "$profile"; echo
 
 # CUDA 12.4 needs driver >= 550.54.14 on Linux (550.x is what 12.4 shipped with)
 drv_major=${DRIVER%%.*}
@@ -91,7 +118,7 @@ gh auth status >/dev/null 2>&1 || [ -n "${GH_TOKEN:-}" ] || die "gh is not signe
 who=$(gh api user --jq .login)
 [ "$who" = hermes-carpet ] || echo "note: signed in as $who, not hermes-carpet" >&2
 
-path=".github/targets/${NAME}.env"
+path=".github/targets/${TNAME}.env"
 old_sha=$(gh api "repos/$REPO/contents/$path" --jq .sha 2>/dev/null || true)
 old=$( [ -n "$old_sha" ] && gh api "repos/$REPO/contents/$path" --jq .content | base64 -d || true)
 # ignore the SCRAPED line when deciding whether anything changed
@@ -99,14 +126,14 @@ if [ -n "$old" ] && diff <(grep -v '^SCRAPED=\|^#' <<<"$old") <(grep -v '^SCRAPE
   echo "profile unchanged in $REPO; not committing"
 else
   [ -z "$old" ] || { echo "=== changes vs the committed profile ==="; diff <(echo "$old") "$profile" || true; }
-  args=(-X PUT "repos/$REPO/contents/$path" -f "message=target: ${NAME} profile scraped on $(hostname -s)"
+  args=(-X PUT "repos/$REPO/contents/$path" -f "message=target: ${TNAME} profile scraped on $(hostname -s)"
         -f "content=$(base64 -w0 "$profile")")
   [ -z "$old_sha" ] || args+=(-f "sha=$old_sha")
   gh api "${args[@]}" --jq '.commit.html_url'
 fi
 
 before=$(date -u +%FT%TZ)
-gh workflow run autobuild.yml --repo "$REPO" -f target="$NAME" -f force=true
+gh workflow run autobuild.yml --repo "$REPO" -f target="$TNAME" -f force=true
 echo "build requested; waiting for the run to appear..."
 run=""
 for _ in $(seq 1 20); do
