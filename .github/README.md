@@ -32,8 +32,8 @@ On the target machine, signed in to `gh` as hermes-carpet (`sudo apt install gh 
 curl -fsSL https://raw.githubusercontent.com/hermes-carpet/UnbiasedStrata/main/.github/scripts/scrape-target.sh | bash -s -- 3090-debian13
 ```
 
-It profiles the box (distro, glibc, CUDA toolkit and where it came from, GPUs/compute capability, driver,
-CPU flags), commits `targets/<name>.env` if it changed, dispatches a build for it and follows the run.
+It profiles the box (distro, glibc, CUDA toolkit and where it came from, GPU model/compute capability,
+CPU flags; no hostname, kernel, driver version or CPU model string: this repo is public), commits `targets/<name>.env` if it changed, dispatches a build for it and follows the run.
 Add `--dry-run` to only print the profile.
 
 ## Packages

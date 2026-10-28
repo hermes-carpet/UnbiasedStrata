@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # Run ON the machine the binaries are for. It profiles the box (distro, glibc, CUDA toolkit
-# and where it came from, GPUs + compute capability, driver, the flags gcc resolves for
+# and where it came from, GPU model + compute capability, the flags gcc resolves for
 # -march=native), commits that as .github/targets/<name>.env to hermes-carpet/UnbiasedStrata,
 # asks GitHub Actions to build for it, and follows the run.
 #
 #   curl -fsSL https://raw.githubusercontent.com/hermes-carpet/UnbiasedStrata/main/.github/scripts/scrape-target.sh | bash -s -- [name]
 #   (or: bash scrape-target.sh [name] [--dry-run])
 #
-# name defaults to the hostname. Needs `gh` signed in as hermes-carpet (`gh auth login`), or
+# name defaults to <gpu>-<distro> (e.g. 3090-debian13). The repo is PUBLIC, so the profile holds
+# only what the build needs: no hostname, kernel, driver version, CPU model string or GPU count.
+# Needs `gh` signed in as hermes-carpet (`gh auth login`), or
 # GH_TOKEN set. Writes nothing to disk except a temp file under /tmp.
 set -euo pipefail
 
 REPO=hermes-carpet/UnbiasedStrata
 TNAME=""; DRY=0
 for a in "$@"; do case "$a" in --dry-run) DRY=1 ;; *) TNAME=$a ;; esac; done
-TNAME=${TNAME:-$(hostname -s)}
 die() { echo "error: $*" >&2; exit 1; }
 
 [ "$(uname -m)" = x86_64 ] || die "only x86_64 targets are supported (this is $(uname -m))"
@@ -50,8 +51,12 @@ fi
 
 # --- GPUs ---------------------------------------------------------------------------------
 gpu_rows=$(nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader)
-DRIVER=$(head -1 <<<"$gpu_rows" | awk -F', ' '{print $3}')
-GPUS=$(awk -F', ' '{gsub(/\./,"",$2); print $1" (sm_"$2")"}' <<<"$gpu_rows" | sort | uniq -c | sed -E 's/^ *([0-9]+) /\1x /' | paste -sd ';' | sed 's/;/; /g')
+DRIVER=$(head -1 <<<"$gpu_rows" | awk -F', ' '{print $3}')   # local check only, never published
+GPUS=$(awk -F', ' '{gsub(/\./,"",$2); print $1" (sm_"$2")"}' <<<"$gpu_rows" | sort -u | paste -sd ';' | sed 's/;/; /g')
+if [ -z "$TNAME" ]; then
+  gpu_num=$(head -1 <<<"$gpu_rows" | grep -oE '[0-9]{4}' | head -1 || true)
+  TNAME="${gpu_num:-gpu}-${ID}$(echo "$VERSION_ID" | tr -d .)"
+fi
 CUDA_ARCHS=$(awk -F', ' '{gsub(/\./,"",$2); print $2"-real"}' <<<"$gpu_rows" | sort -u | paste -sd ';')
 
 # --- host compiler: the newest gcc this nvcc accepts (same probe as upstream's Makefile) ---
@@ -72,14 +77,13 @@ fi
 # --- CPU: what -march=native means here, resolved by that gcc (or the nearest one here) ---
 gcc_bin=$(command -v "gcc-$HOST_GCC" || command -v gcc-14 || command -v gcc-13 || command -v gcc || true)
 [ -n "$gcc_bin" ] || die "no gcc on this box to resolve -march=native (apt install gcc)"
-CPU_MODEL=$(sed -nE 's/^model name\s*:\s*//p' /proc/cpuinfo | head -1)
 # capture all of gcc's output first: grep -m1 in a pipe would SIGPIPE gcc (exit 2 under pipefail)
 gcc_v=$("$gcc_bin" -march=native -E -v - </dev/null 2>&1 || true)
 cc1=$(printf '%s\n' "$gcc_v" | { grep '/cc1 ' || true; } | sed -n 1p)
 CPU_MARCH=$(printf '%s\n' "$cc1" | tr ' ' '\n' | sed -n 's/^-march=//p' | sed -n 1p)
-# keep -march/-mtune/-m<isa>/-mno-<isa> and the cache --params (cc1 prints "--param k=v")
-CPU_FLAGS=$(printf '%s\n' "$cc1" | sed 's/--param /--param=/g' | tr ' ' '\n' \
-  | { grep -E -- '^-m(arch|tune|[a-z0-9])|^--param=' || true; } | { grep -v -- '^-mtune=generic$' || true; } | paste -sd ' ')
+# keep -march/-mtune/-m<isa>/-mno-<isa>; drop the cache-size --params (they narrow down the exact CPU)
+CPU_FLAGS=$(printf '%s\n' "$cc1" | tr ' ' '\n' \
+  | { grep -E -- '^-m(arch|tune|[a-z0-9])' || true; } | { grep -v -- '^-mtune=generic$' || true; } | paste -sd ' ')
 [ -n "$CPU_MARCH" ] || die "could not resolve -march=native with $gcc_bin"
 
 GLIBC=$(getconf GNU_LIBC_VERSION | awk '{print $2}')
@@ -88,9 +92,9 @@ IMAGE="${ID}:${VERSION_ID}"
 profile=$(mktemp /tmp/target-XXXXXX.env)
 trap 'rm -f "$profile"' EXIT
 cat > "$profile" <<EOF
-# Build target profile, scraped on $(hostname -s) by .github/scripts/scrape-target.sh.
+# Build target profile, scraped by .github/scripts/scrape-target.sh.
 TARGET_NAME='$TNAME'
-SCRAPED='$(date -u +%FT%TZ) on $(hostname -s)'
+SCRAPED='$(date -u +%F)'
 IMAGE='$IMAGE'
 CUDA_SOURCE='$CUDA_SOURCE'
 CUDA_VERSION='$CUDA_VERSION'
@@ -98,10 +102,7 @@ CUDA_ON_TARGET='$CUDA_ON_TARGET'
 CUDA_ARCHS='$CUDA_ARCHS'
 HOST_GCC='$HOST_GCC'
 GPUS='$GPUS'
-DRIVER='$DRIVER'
-KERNEL='$(uname -r)'
 GLIBC='$GLIBC'
-CPU_MODEL='$CPU_MODEL'
 CPU_MARCH='$CPU_MARCH'
 CPU_FLAGS='$CPU_FLAGS'
 EOF
@@ -126,7 +127,7 @@ if [ -n "$old" ] && diff <(grep -v '^SCRAPED=\|^#' <<<"$old") <(grep -v '^SCRAPE
   echo "profile unchanged in $REPO; not committing"
 else
   [ -z "$old" ] || { echo "=== changes vs the committed profile ==="; diff <(echo "$old") "$profile" || true; }
-  args=(-X PUT "repos/$REPO/contents/$path" -f "message=target: ${TNAME} profile scraped on $(hostname -s)"
+  args=(-X PUT "repos/$REPO/contents/$path" -f "message=target: ${TNAME} profile (scraped $(date -u +%F))"
         -f "content=$(base64 -w0 "$profile")")
   [ -z "$old_sha" ] || args+=(-f "sha=$old_sha")
   gh api "${args[@]}" --jq '.commit.html_url'
