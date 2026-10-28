@@ -36,8 +36,20 @@ curl -fsSL https://raw.githubusercontent.com/hermes-carpet/UnbiasedStrata/main/.
 ```
 
 It profiles the box (distro, glibc, CUDA toolkit and where it came from, GPU model/compute capability,
-CPU flags; no hostname, kernel, driver version or CPU model string: this repo is public), commits `targets/<name>.env` if it changed, dispatches a build for it and follows the run.
+CPU; no hostname, kernel, driver version or CPU model string: this repo is public), commits `targets/<name>.env` if it changed, dispatches a build for it and follows the run.
 Add `--dry-run` to only print the profile.
+
+`--cpu=` sets how much of the CPU is published (and so what ggml-cpu, which runs any experts that do
+not fit in VRAM, is compiled for). GPU kernels are the same in all three:
+
+| `--cpu=` | publishes | CPU code |
+|---|---|---|
+| `level` (default) | the x86-64 level (`x86-64-v3`, `-v4` on AVX-512 boxes) | no VNNI/BF16 dot products, generic tuning |
+| `ggml` | the level + the extensions ggml-cpu has code paths for (VNNI, BF16, VBMI, AMX) | all of ggml's fast paths, generic tuning |
+| `native` | everything gcc resolves for `-march=native` (pins down the CPU generation) | what `make build` on the box gives |
+
+The flags are resolved with the gcc CI builds with (`gcc-13` for CUDA 12.x). CI drops any single flag its
+gcc does not know rather than the whole list, and notes it in `BUILDINFO.txt`.
 
 ## Packages
 

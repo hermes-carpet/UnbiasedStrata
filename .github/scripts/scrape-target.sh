@@ -5,17 +5,21 @@
 # asks GitHub Actions to build for it, and follows the run.
 #
 #   curl -fsSL https://raw.githubusercontent.com/hermes-carpet/UnbiasedStrata/main/.github/scripts/scrape-target.sh | bash -s -- [name]
-#   (or: bash scrape-target.sh [name] [--dry-run])
+#   (or: bash scrape-target.sh [name] [--cpu=level|ggml|native] [--dry-run])
 #
 # name defaults to <gpu>-<distro> (e.g. 3090-debian13). The repo is PUBLIC, so the profile holds
 # only what the build needs: no hostname, kernel, driver version, CPU model string or GPU count.
+# --cpu sets how much of the CPU it publishes (the full flag list pins down the CPU generation):
+#   level  (default) the x86-64 level only (x86-64-v3 / -v4)
+#   ggml   the level + the extensions ggml-cpu has code paths for (VNNI, BF16, VBMI, AMX)
+#   native everything gcc resolves for -march=native (what `make build` on the box would use)
 # Needs `gh` signed in as hermes-carpet (`gh auth login`), or
 # GH_TOKEN set. Writes nothing to disk except a temp file under /tmp.
 set -euo pipefail
 
 REPO=hermes-carpet/UnbiasedStrata
-TNAME=""; DRY=0
-for a in "$@"; do case "$a" in --dry-run) DRY=1 ;; *) TNAME=$a ;; esac; done
+TNAME=""; DRY=0 CPU_MODE=level
+for a in "$@"; do case "$a" in --dry-run) DRY=1 ;; --cpu=*) CPU_MODE=${a#--cpu=} ;; *) TNAME=$a ;; esac; done
 die() { echo "error: $*" >&2; exit 1; }
 
 [ "$(uname -m)" = x86_64 ] || die "only x86_64 targets are supported (this is $(uname -m))"
@@ -74,17 +78,43 @@ else
   case "$CUDA_VERSION" in 12.*) HOST_GCC=13 ;; *) HOST_GCC=14 ;; esac
 fi
 
-# --- CPU: what -march=native means here, resolved by that gcc (or the nearest one here) ---
-gcc_bin=$(command -v "gcc-$HOST_GCC" || command -v gcc-14 || command -v gcc-13 || command -v gcc || true)
-[ -n "$gcc_bin" ] || die "no gcc on this box to resolve -march=native (apt install gcc)"
+# --- CPU: what -march=native means here, resolved by the gcc CI builds with ---------------
+# Resolved by gcc-$HOST_GCC when it is installed. Another gcc may name a -march/-mtune that
+# gcc-$HOST_GCC does not know (gcc-14: znver5, gcc-13: no), so then only its -m<isa> feature
+# flags are kept, on top of the x86-64 level; CI drops any single flag its gcc rejects.
+gcc_bin=$(command -v "gcc-$HOST_GCC" || true) exact_gcc=yes
+[ -n "$gcc_bin" ] || { exact_gcc=no; gcc_bin=$(command -v gcc-14 || command -v gcc-13 || command -v gcc || true); }
+[ -n "$gcc_bin" ] || die "no gcc on this box to resolve -march=native (apt install gcc-$HOST_GCC)"
 # capture all of gcc's output first: grep -m1 in a pipe would SIGPIPE gcc (exit 2 under pipefail)
 gcc_v=$("$gcc_bin" -march=native -E -v - </dev/null 2>&1 || true)
 cc1=$(printf '%s\n' "$gcc_v" | { grep '/cc1 ' || true; } | sed -n 1p)
-CPU_MARCH=$(printf '%s\n' "$cc1" | tr ' ' '\n' | sed -n 's/^-march=//p' | sed -n 1p)
-# keep -march/-mtune/-m<isa>/-mno-<isa>; drop the cache-size --params (they narrow down the exact CPU)
-CPU_FLAGS=$(printf '%s\n' "$cc1" | tr ' ' '\n' \
-  | { grep -E -- '^-m(arch|tune|[a-z0-9])' || true; } | { grep -v -- '^-mtune=generic$' || true; } | paste -sd ' ')
-[ -n "$CPU_MARCH" ] || die "could not resolve -march=native with $gcc_bin"
+native=$(printf '%s\n' "$cc1" | tr ' ' '\n')
+grep -q -- '^-march=' <<<"$native" || die "could not resolve -march=native with $gcc_bin"
+has() { for f in "$@"; do grep -qx -- "-m$f" <<<"$native" || return 1; done; }
+# the x86-64 psABI level: the always-safe fallback, and all that --cpu=level publishes
+if has avx512f avx512bw avx512cd avx512dq avx512vl avx2 bmi2 fma movbe; then CPU_MARCH=x86-64-v4
+elif has avx2 bmi bmi2 fma f16c movbe; then CPU_MARCH=x86-64-v3
+elif has sse4.2 popcnt ssse3 cx16; then CPU_MARCH=x86-64-v2
+else CPU_MARCH=x86-64; fi
+case "$CPU_MODE" in
+  level) CPU_FLAGS="" ;;
+  ggml)
+    # the level + only the extensions ggml-cpu has code paths for (VNNI dot products,
+    # BF16, VBMI, AMX): its speed without the rest of the CPU's fingerprint
+    CPU_FLAGS="-march=$CPU_MARCH"
+    for f in avxvnni avx512vnni avx512bf16 avx512vbmi amx-tile amx-int8 amx-bf16; do
+      ! has "$f" || CPU_FLAGS+=" -m$f"
+    done ;;
+  native)
+    # keep -march/-mtune/-m<isa>/-mno-<isa>; drop the cache-size --params (they narrow down the exact CPU)
+    CPU_FLAGS=$( { grep -E -- '^-m(arch|tune|[a-z0-9])' <<<"$native" || true; } | { grep -v -- '^-mtune=generic$' || true; })
+    if [ "$exact_gcc" = no ]; then
+      echo "note: gcc-$HOST_GCC is not installed; resolved with $gcc_bin and kept only its feature flags (apt install gcc-$HOST_GCC for exact flags)" >&2
+      CPU_FLAGS=$(printf -- '-march=%s\n%s\n' "$CPU_MARCH" "$(grep -vE -- '^-m(arch|tune)=' <<<"$CPU_FLAGS")")
+    fi
+    CPU_FLAGS=$(paste -sd ' ' <<<"$CPU_FLAGS") ;;
+  *) die "--cpu must be level, ggml or native" ;;
+esac
 
 GLIBC=$(getconf GNU_LIBC_VERSION | awk '{print $2}')
 IMAGE="${ID}:${VERSION_ID}"
@@ -103,6 +133,7 @@ CUDA_ARCHS='$CUDA_ARCHS'
 HOST_GCC='$HOST_GCC'
 GPUS='$GPUS'
 GLIBC='$GLIBC'
+CPU_MODE='$CPU_MODE'
 CPU_MARCH='$CPU_MARCH'
 CPU_FLAGS='$CPU_FLAGS'
 EOF

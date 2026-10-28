@@ -75,14 +75,21 @@ echo "::endgroup::"
 
 echo "::group::compiler wrapper: -march=native -> target CPU"
 real_cxx=$(command -v "g++-${HOST_GCC}") real_cc=$(command -v "gcc-${HOST_GCC}")
-flags="${CPU_FLAGS:-}" flag_note=""
-if [ -n "$flags" ] && ! echo 'int main(){}' | "$real_cxx" $flags -x c++ - -o /dev/null 2>/tmp/flagerr; then
-  flag_note="g++-${HOST_GCC} rejected the scraped CPU_FLAGS ($(head -c 300 /tmp/flagerr | tr '\n' ' ' | tr -d "'\"$\`")); fell back to -march=${CPU_MARCH}"
+accepts() { echo 'int main(){}' | "$real_cxx" "$@" -x c++ - -o /dev/null 2>/dev/null; }
+# the scraped -march (CPU name or x86-64 level) first, else the level; then each other flag on
+# top of it, dropping only the ones this gcc does not know (a newer gcc's ISA or CPU names)
+march=$(tr ' ' '\n' <<<"${CPU_FLAGS:-}" | sed -n '/^-march=/{p;q}')
+[ -n "$march" ] && accepts "$march" || march="-march=${CPU_MARCH:-x86-64-v3}"
+accepts "$march"
+flags=$march dropped=""
+for f in $(tr ' ' '\n' <<<"${CPU_FLAGS:-}" | grep -v -- '^-march='); do
+  if accepts $flags "$f"; then flags+=" $f"; else dropped+=" $f"; fi
+done
+flag_note=""
+if [ -n "$dropped" ] || { [ -n "${CPU_FLAGS:-}" ] && ! grep -qx -- "$march" <<<"$(tr ' ' '\n' <<<"$CPU_FLAGS")"; }; then
+  flag_note="g++-${HOST_GCC} does not know some scraped CPU flags; built with ${march} and without:${dropped:- (none)}"
   echo "::warning::$flag_note"
-  flags=""
 fi
-[ -n "$flags" ] || flags="-march=${CPU_MARCH:-x86-64-v3}"
-echo 'int main(){}' | "$real_cxx" $flags -x c++ - -o /dev/null
 mkdir -p /opt/xcc
 for pair in "g++-${HOST_GCC}:$real_cxx" "gcc-${HOST_GCC}:$real_cc"; do
   name=${pair%%:*} real=${pair#*:}
