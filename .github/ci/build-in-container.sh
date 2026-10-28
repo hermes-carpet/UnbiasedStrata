@@ -26,10 +26,10 @@ group() { echo "::group::$*"; }
 endgroup() { echo "::endgroup::"; }
 . /etc/os-release
 
-# the checkout belongs to the runner user, this container runs as root
-git config --global --add safe.directory '*'
 # a plain distro image: install the toolchain first (~2 min; the compile is what ccache saves)
 [ -f /opt/xcc/toolchain.env ] || bash "$HERE/setup-toolchain.sh" "$PROFILE"
+# the checkout belongs to the runner user, this container runs as root
+git config --global --add safe.directory '*'
 # shellcheck disable=SC1091
 source /opt/xcc/toolchain.env
 [ -z "$TC_PATH_PREFIX" ] || export PATH="$TC_PATH_PREFIX:$PATH"
