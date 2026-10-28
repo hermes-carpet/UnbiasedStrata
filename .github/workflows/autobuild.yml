@@ -1,0 +1,302 @@
+# Auto-build UnbiasedStrata (robertkarl/UnbiasedStrata) ahead-of-time for each machine
+# profiled in .github/targets/*.env, and publish the binaries as a GitHub Release.
+#
+# Same pattern as hermes-carpet/whisper-cuda-win and llama-slim:
+#   - a daily poll of upstream main; it only builds when upstream moved past the last
+#     PUBLISHED commit (.github/upstream-sha), or on a manual/forced dispatch;
+#   - a build that fails publishes nothing -- the last good release stays;
+#   - on success, this fork's main is synced to the built upstream commit and the new
+#     .github/upstream-sha is committed as hermes-carpet (that self-commit is also the
+#     keepalive: GitHub disables cron workflows after 60 days without repo activity;
+#     a quiet upstream gets an explicit keepalive commit after 45 days);
+#   - any failure opens (or comments on) one issue labelled `auto-build`, like the
+#     presenton fork's upstream-sync; the next green run closes it.
+#
+# A target = one .github/targets/<name>.env file (written on the target box by
+# .github/scripts/scrape-target.sh). Each is built in a container of the target's distro
+# with the target's exact CUDA toolkit, its GPU arch as SASS only (no PTX: nothing is
+# JIT-compiled at run time), and ggml-cpu's -march=native swapped for the flags gcc
+# resolves for -march=native on the target CPU. See .github/ci/build-in-container.sh.
+#
+# No GPU on the runners: CI runs upstream's `make test` (front end vs a fake engine) and
+# checks the CUDA binaries structurally (SASS arch, no stray PTX, linked libs, glibc).
+
+name: autobuild
+
+on:
+  schedule:
+    - cron: '41 6 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_sha:
+        description: 'Upstream commit to build (default: latest main)'
+        required: false
+        default: ''
+      target:
+        description: 'Only this target (.github/targets/<name>.env); default: all'
+        required: false
+        default: ''
+      force:
+        description: 'Build even if this upstream commit is already published'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: autobuild
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: robertkarl/UnbiasedStrata
+  UPSTREAM_BRANCH: main
+  ISSUE_LABEL: auto-build
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      build_sha: ${{ steps.check.outputs.build_sha }}
+      label: ${{ steps.check.outputs.label }}
+      targets: ${{ steps.targets.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve upstream commit and compare with last published
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_SHA: ${{ inputs.upstream_sha }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          ref="${INPUT_SHA:-$UPSTREAM_BRANCH}"
+          json=""
+          for i in 1 2 3; do
+            json=$(gh api "repos/$UPSTREAM_REPO/commits/$ref" 2>/dev/null) && break
+            echo "attempt $i: could not resolve $ref; retrying in 15s"; sleep 15
+          done
+          [ -n "$json" ] || { echo "::error::cannot resolve $UPSTREAM_REPO@$ref"; exit 1; }
+          sha=$(jq -r .sha <<<"$json")
+          day=$(jq -r .commit.committer.date <<<"$json" | cut -c1-10 | tr -d -)
+          published=$(cat .github/upstream-sha 2>/dev/null || true)
+          echo "upstream $ref = $sha ($day); last published = ${published:-<none>}"
+          echo "build_sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "label=${day}-${sha:0:7}" >> "$GITHUB_OUTPUT"
+          if [ "$sha" = "$published" ] && [ "$FORCE" != "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"; echo "Already published; nothing to build."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: List build targets
+        id: targets
+        env:
+          ONLY: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          list='[]'
+          for f in .github/targets/*.env; do
+            name=$(basename "$f" .env)
+            [ -z "$ONLY" ] || [ "$ONLY" = "$name" ] || continue
+            image=$(bash -c "source '$f'; echo \"\$IMAGE\"")
+            list=$(jq -c --arg n "$name" --arg f "$f" --arg i "$image" '. + [{name:$n,file:$f,image:$i}]' <<<"$list")
+          done
+          [ "$list" != '[]' ] || { echo "::error::no target matches '${ONLY}'"; exit 1; }
+          echo "targets=$list" >> "$GITHUB_OUTPUT"; echo "$list"
+
+      - name: Keepalive commit if the repo has been quiet for 45 days
+        if: steps.check.outputs.changed == 'false'
+        run: |
+          set -euo pipefail
+          age=$(( ($(date +%s) - $(git log -1 --format=%ct)) / 86400 ))
+          echo "last commit on main: ${age} days ago"
+          [ "$age" -ge 45 ] || exit 0
+          date -u +%FT%TZ > .github/keepalive
+          git config user.name  "hermes-carpet"
+          git config user.email "hermes-carpet@users.noreply.github.com"
+          git add .github/keepalive
+          git commit -m "keepalive: upstream quiet for ${age} days"
+          git push
+
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.check.outputs.targets) }}
+    name: build (${{ matrix.target.name }})
+    env:
+      BUILD_SHA: ${{ needs.check.outputs.build_sha }}
+      LABEL: ${{ needs.check.outputs.label }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free runner disk (the CUDA toolkit + build need ~20 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          docker image prune -af >/dev/null || true
+          df -h /
+
+      - name: Fetch upstream at ${{ needs.check.outputs.build_sha }} (+ llama.cpp submodule)
+        run: |
+          set -euo pipefail
+          mkdir upstream && cd upstream
+          git init -q
+          git remote add origin "https://github.com/$UPSTREAM_REPO"
+          git fetch -q --depth 1 origin "$BUILD_SHA"
+          git checkout -q FETCH_HEAD
+          git submodule update --init --depth 1
+          echo "upstream $(git rev-parse HEAD); llama.cpp $(git -C third_party/llama.cpp rev-parse HEAD)"
+
+      - name: Build + check + package in ${{ matrix.target.image }}
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w -e JOBS=4 "${{ matrix.target.image }}" \
+            bash .github/ci/build-in-container.sh "${{ matrix.target.file }}" /w/upstream /w/dist "$LABEL"
+          sudo chown -R "$(id -u)" dist
+          grep -v '^WARN' "dist/checks-${{ matrix.target.name }}.txt" | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.target.name }}
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS-*.txt
+            dist/checks-*.txt
+          retention-days: 7
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ matrix.target.name }}
+          path: |
+            dist/build-*.log
+            dist/test-*.log
+            dist/checks-*.txt
+          retention-days: 14
+          if-no-files-found: warn
+
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    env:
+      BUILD_SHA: ${{ needs.check.outputs.build_sha }}
+      LABEL: ${{ needs.check.outputs.label }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: 'pkg-*'
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create / update the release
+        run: |
+          set -euo pipefail
+          tag="strata-${LABEL}"
+          mapfile -t files < <(find artifacts -name '*.tar.gz' -o -name 'SHA256SUMS-*.txt' | sort)
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no packages to publish"; exit 1; }
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "UnbiasedStrata ${LABEL}" --notes "placeholder" --latest
+          fi
+          gh release upload "$tag" "${files[@]}" --clobber
+          assets=$(gh release view "$tag" --json assets --jq '.assets[].name' | sort)
+          {
+            echo "AOT build of [\`$UPSTREAM_REPO\`@\`${BUILD_SHA:0:12}\`](https://github.com/$UPSTREAM_REPO/commit/$BUILD_SHA) — Linux x86_64, CUDA, per target machine."
+            echo
+            echo "## Targets"
+            for f in artifacts/checks-*.txt; do
+              t=$(basename "$f" .txt); t=${t#checks-}
+              echo "### \`$t\`"
+              echo '```'; grep -v '^WARN' "$f"; echo '```'
+            done
+            echo
+            echo "## Packages"
+            echo "- \`unbiased-strata-<label>-<target>.tar.gz\`: uses the target's own CUDA runtime (libcudart / libcublas from its toolkit)."
+            echo "- \`...-cudalibs.tar.gz\`: same binaries plus those CUDA runtime libs in \`bin/lib\` (only the NVIDIA driver needed)."
+            echo
+            echo "Binaries carry RUNPATH \`\$ORIGIN:\$ORIGIN/lib\`; \`BUILDINFO.txt\` in each tarball has the full target profile and CI checks."
+            echo
+            echo '```'
+            echo "tar xzf unbiased-strata-${LABEL}-<target>.tar.gz && cd unbiased-strata-${LABEL}-<target>"
+            echo 'bin/unbiased-strata --engine strata-poly -m <model.gguf> --host 127.0.0.1 --port 18091 -- --model <model.gguf>'
+            echo '```'
+            echo
+            echo "## Assets"
+            sed 's/^/- `/; s/$/`/' <<<"$assets"
+            echo
+            echo "_Not GPU-tested in CI (no GPU on GitHub runners): \`make test\` + structural CUDA checks only._"
+          } > notes.md
+          gh release edit "$tag" --notes-file notes.md
+
+      - name: Sync fork main to the built upstream commit (commit as hermes-carpet)
+        run: |
+          set -euo pipefail
+          git config user.name  "hermes-carpet"
+          git config user.email "hermes-carpet@users.noreply.github.com"
+          git fetch -q "https://github.com/$UPSTREAM_REPO" "$BUILD_SHA"
+          if ! git merge --no-edit -m "sync upstream ${BUILD_SHA:0:12}" FETCH_HEAD; then
+            git merge --abort || true
+            echo "::error::merging upstream ${BUILD_SHA} into the fork conflicts (release was published; fork not synced)"
+            exit 1
+          fi
+          echo "$BUILD_SHA" > .github/upstream-sha
+          git add .github/upstream-sha
+          git commit -m "autobuild: published strata-${LABEL}" || echo "upstream-sha unchanged"
+          git push origin HEAD:main
+
+      - name: Close open auto-build issues
+        run: |
+          for n in $(gh issue list --state open --label "$ISSUE_LABEL" --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Fixed: [run ${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) published \`strata-${LABEL}\`."
+          done
+
+  report-failure:
+    needs: [check, build, publish]
+    if: always() && (needs.check.result == 'failure' || needs.build.result == 'failure' || needs.publish.result == 'failure')
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_SHA: ${{ needs.check.outputs.build_sha }}
+    steps:
+      - name: Open or comment on the auto-build issue
+        run: |
+          set -euo pipefail
+          gh label create "$ISSUE_LABEL" --repo "$GITHUB_REPOSITORY" --color d93f0b \
+            --description "Automated UnbiasedStrata build needs attention" 2>/dev/null || true
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          failed=$(gh run view "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --json jobs \
+                    --jq '.jobs[] | select(.conclusion=="failure") | "- \(.name)"')
+          marker="<!-- auto-build:${BUILD_SHA:-unresolved}:${{ needs.check.result }}${{ needs.build.result }}${{ needs.publish.result }} -->"
+          body=$(printf 'The autobuild failed for upstream `%s`.\n\nRun: %s\n\nFailed jobs:\n%s\n\nJob results: check=%s build=%s publish=%s\n\n%s\n' \
+                  "${BUILD_SHA:-<unresolved>}" "$run_url" "$failed" \
+                  "${{ needs.check.result }}" "${{ needs.build.result }}" "${{ needs.publish.result }}" "$marker")
+          open=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label "$ISSUE_LABEL" --json number --jq '.[0].number // empty')
+          if [ -n "$open" ]; then
+            if gh issue view "$open" --repo "$GITHUB_REPOSITORY" --comments --json body,comments \
+                 --jq '[.body] + [.comments[].body] | join("\n")' | grep -qF "$marker"; then
+              echo "Already reported on #$open"; exit 0
+            fi
+            gh issue comment "$open" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --label "$ISSUE_LABEL" \
+              --title "Autobuild failing (upstream ${BUILD_SHA:0:12})" --body "$body"
+          fi
