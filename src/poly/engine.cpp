@@ -1011,6 +1011,20 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         starts = layer_starts(o.layer_split, file, (int) blocks->u - (nextn ? (int) nextn->u : 0), cards);
         ck(cudaSetDevice(was), "cudaSetDevice");
     }
+    // STRATA_BLOCKING_SYNC=1: the thread that waits for the card sleeps on it instead of spinning (a laptop whose
+    // CPU shares the card's heat); a wake costs some microseconds a wait.
+    if (const char* v = std::getenv("STRATA_BLOCKING_SYNC"); v && std::atoi(v) != 0) {
+        int was = 0;   // an unsplit engine loads on the caller's card: leave it selected
+        ck(cudaGetDevice(&was), "cudaGetDevice");
+        for (int d = 0; d < std::max(1, devices); ++d) {
+            ck(cudaSetDevice(d), "cudaSetDevice");
+            if (cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) != cudaSuccess) {
+                cudaGetLastError();
+                std::fprintf(stderr, "strata-poly: card %d: could not set blocking sync\n", d);
+            }
+        }
+        ck(cudaSetDevice(was), "cudaSetDevice");
+    }
     if (starts.empty()) {
         std::unique_ptr<Engine> engine = make();
         engine->load(o);
@@ -1587,6 +1601,8 @@ void Engine::load(const Options& o) {
         throw std::runtime_error("a prompt batch is 1 to 4096 tokens");
     if (opt_.stage_mib < 1) throw std::runtime_error("the staging buffer must be at least 1 MiB");
     if (opt_.stage_ahead < 0) throw std::runtime_error("the batch size to stage ahead from cannot be negative");
+    if (opt_.stage_rows < 1 || opt_.stage_rows > kStageRows)
+        throw std::runtime_error("--stage-rows takes 1 to " + std::to_string(kStageRows));
     if (opt_.expert_swaps < 0 || opt_.expert_swaps > 64)
         throw std::runtime_error("0 to 64 experts can be on their way into the cache at a time");
     if (opt_.window < 0 || opt_.window > 8)
@@ -1838,9 +1854,19 @@ void Engine::alloc() {
     for (int il = 0; il < n_layer_; ++il) {
         Layer& L = layers_[(size_t) il];
         if (!L.moe) continue;
-        L.mmq = opt_.gpu_experts && rows_ >= kStageRows && Mmq::fits((int) L.gu_type, 2 * n_ff_exp_, n_embd_) &&
+        L.mmq = opt_.gpu_experts && rows_ >= opt_.stage_rows && Mmq::fits((int) L.gu_type, 2 * n_ff_exp_, n_embd_) &&
                 Mmq::fits((int) L.d_type, n_embd_, n_ff_exp_);
         tiles = tiles || L.mmq;
+        // the pointer-table kernels have no tile for rows that are not a multiple of 128 (Mmq::mul_tab)
+        L.tab = L.mmq && opt_.mmq_tab && Mmq::tab((int) L.gu_type) && Mmq::tab((int) L.d_type) &&
+                (2 * n_ff_exp_) % 128 == 0 && n_embd_ % 128 == 0;
+        if (L.mmq && opt_.mmq_tab && !L.tab && !tab_warned_) {
+            tab_warned_ = true;
+            std::fprintf(stderr, "strata-poly: layer %d's cached experts go one launch per run of slots: %s\n", il,
+                         Mmq::tab((int) L.gu_type) && Mmq::tab((int) L.d_type)
+                             ? "the expert width is not a multiple of 128"
+                             : "this build has no pointer-table MMQ for their types (STRATA_POLY_MMQ_TAB)");
+        }
         one_expert = std::max(one_expert, 2 * L.gu_bytes + L.d_bytes);
     }
     if (tiles) mmq_ = std::make_unique<Mmq>();
@@ -2008,6 +2034,7 @@ const Stats& Engine::stats() const {
         const Stats& s = e->stats_;
         all_stats_.gpu_experts += s.gpu_experts;
         all_stats_.cpu_experts += s.cpu_experts;
+        all_stats_.staged_experts += s.staged_experts;
         all_stats_.batch_cached += s.batch_cached;
         all_stats_.batch_staged += s.batch_staged;
         all_stats_.swapped_experts += s.swapped_experts;
@@ -2105,7 +2132,7 @@ void Engine::lin(const Dev& w, const float* x, float* y, int n, const void* xq, 
 
 void Engine::router_scores(const Layer& L, int n) { lin(L.gate_inp, xn_, rl_, n, xq_); }
 
-bool Engine::batched(const Layer& L, int n) const { return mmq_ && L.mmq && n >= kStageRows; }
+bool Engine::batched(const Layer& L, int n) const { return mmq_ && L.mmq && n >= opt_.stage_rows; }
 
 // The router's scores, and the copies of them and of the experts' input to the host.
 void Engine::moe_router(const Layer& L, int n) {
@@ -2406,9 +2433,29 @@ void Engine::moe_rows(Layer& L, int il, int n) {
                   w + (size_t) t * n_used_, tmp);
     });
     count_.assign((size_t) n_expert_, 0);
+    const bool answer = n < kStageRows;   // an answer's window through this path (--stage-rows), not a prompt batch
     for (int i = 0; i < rr; ++i) {
         ++count_[(size_t) ids_[(size_t) i]];
         ++use_[(size_t) il * n_expert_ + (size_t) ids_[(size_t) i]];
+        // what moe() counts for follow(): the cache keeps trading for the experts the answer uses
+        if (answer && n_swap_ > 0) recent_[(size_t) il * n_expert_ + (size_t) ids_[(size_t) i]] += 1.f;
+    }
+    // Options::tail_skip, as moe() applies it to the calls that went through it before --stage-rows was lowered: an
+    // expert outside VRAM that every token of the window ranks at tail_skip or later is left out.  Its rows keep no
+    // weight and take no place among the card's or the CPU's.
+    int n_tail = 0;
+    left_out_.assign((size_t) n_expert_, 0);
+    if (answer && opt_.tail_skip > 0) {
+        for (int i = 0; i < rr; ++i)
+            if (i % n_used_ < opt_.tail_skip) left_out_[(size_t) ids_[(size_t) i]] = 2;   // ranked high by a token: kept
+        for (int e = 0; e < n_expert_; ++e) {
+            const bool out = count_[(size_t) e] > 0 && !L.slot[(size_t) e] && left_out_[(size_t) e] != 2;
+            left_out_[(size_t) e] = out;
+            if (!out) continue;
+            stats_.tail_experts += count_[(size_t) e];
+            n_tail += count_[(size_t) e];
+            count_[(size_t) e] = 0;
+        }
     }
     // The CPU computes some of the routed experts outside VRAM while the others are copied: the ones the fewest
     // tokens chose, whose copy costs as much as any other's and which cost the CPU about as much as their tokens.
@@ -2459,6 +2506,10 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     host_.clear();
     for (int i = 0; i < rr; ++i) {
         const size_t e = (size_t) ids_[(size_t) i];
+        if (left_out_[e]) {   // left out (tail_skip): no row, and nothing of it in the sum
+            w[i] = 0.f;
+            continue;
+        }
         if (on_cpu_[e]) {   // by token, as cpu_experts() takes them, and nothing of it in the card's sum
             host_.push_back({L.exp_gate + e * L.gu_stride, L.exp_up + e * L.gu_stride, L.exp_down + e * L.d_bytes,
                              w[i], i / n_used_});
@@ -2496,22 +2547,33 @@ void Engine::moe_rows(Layer& L, int il, int n) {
        "expert rows");
 
     const int rc = bounds[n_cached];   // the rows of the cached experts
-    stats_.batch_cached += rc;
-    stats_.batch_staged += rg - rc;
+    if (answer) {   // an answer's window: counted as decoding, the staged rows as misses
+        stats_.gpu_experts += rc;
+        stats_.staged_experts += rg - rc;
+    } else {
+        stats_.batch_cached += rc;
+        stats_.batch_staged += rg - rc;
+    }
 
     const float limit = clamp_exp_[(size_t) il];
     const int gt = (int) L.gu_type, dt = (int) L.d_type;
     const int64_t ff = n_ff_exp_, ff2 = 2 * ff;
     int holds = -1;   // the round in the buffer when this call is done
-    // The card's part.  With the CPU's beside it, the rows of its experts' places are left at nothing.
+    // The card's part.  With the CPU's beside it, or experts left out, the rows of those places are left at nothing.
     const auto card = [&] {
-        if (n_cpu > 0) ck(cudaMemsetAsync(dx_, 0, (size_t) rr * n_embd_ * sizeof(float), cs(st_)), "expert rows");
+        if (n_cpu > 0 || n_tail > 0)
+            ck(cudaMemsetAsync(dx_, 0, (size_t) rr * n_embd_ * sizeof(float), cs(st_)), "expert rows");
         if (rg > 0) Mmq::quantize(xn_, d_tok, mq_, gt, n_embd_, n_embd_, rg, st_);
 
         // The cached experts whose slots lie one behind the other are the matrices of one launch, as the experts of
         // a staging round are; a launch for each class that has rows among them.  The cache is filled a layer's
         // experts side by side, so that is the whole layer until experts trade slots (follow()).  A launch for each
         // expert was a sixth of a long prompt's time in a model with 256 experts a layer.
+        //
+        // Once follow() has traded slots away, a layer's cached experts lie in many short runs, and a window's few
+        // experts with rows would go one launch each.  The pointer-table kernel (Mmq::mul_tab) takes up to kTab of
+        // them wherever their slots lie: a class goes by the table when that is fewer launches than its runs.  The
+        // table's launch runs over exactly the class's experts with rows, which group_ has class after class.
         auto slot_of = [&](int j) { return L.slot[(size_t) chan_[(size_t) j]]; };
         runs_.clear();
         for (int j = 0; j < n_chan;) {
@@ -2525,17 +2587,52 @@ void Engine::moe_rows(Layer& L, int il, int n) {
                 if (most[c] > 0) runs_.push_back({c, j, m, most[c]});
             j += m;
         }
-        for (const Run& r : runs_)
-            mmq_->mul(slot_of(r.j), gt, ff2, n_embd_, L.slot_bytes, r.m, mq_, d_cb + (size_t) r.c * cb_row + r.j, iota_,
-                      rg, r.most, gu_, ff2, st_);
+        int n_run[kClasses] = {}, c0[kClasses + 1] = {};   // a class's runs; where its experts start in group_
+        for (const Run& r : runs_) ++n_run[r.c];
+        for (int c = 0, g = 0; c < kClasses; ++c) {
+            c0[c] = g;
+            while (g < n_cached && tile_class(rows_of(g)) == c) ++g;
+        }
+        c0[kClasses] = n_cached;
+        bool by_tab[kClasses];
+        for (int c = 0; c < kClasses; ++c)
+            by_tab[c] = L.tab && c0[c + 1] > c0[c] && (c0[c + 1] - c0[c] + Mmq::kTab - 1) / Mmq::kTab < n_run[c];
+        const auto cached = [&](bool down) {
+            for (const Run& r : runs_) {
+                if (by_tab[r.c]) continue;
+                const int32_t* b = d_cb + (size_t) r.c * cb_row + r.j;
+                if (down)
+                    mmq_->mul(slot_of(r.j) + gu2, dt, n_embd_, ff, L.slot_bytes, r.m, mq2_, b, d_place, rc, r.most, dx_,
+                              n_embd_, st_);
+                else
+                    mmq_->mul(slot_of(r.j), gt, ff2, n_embd_, L.slot_bytes, r.m, mq_, b, iota_, rg, r.most, gu_, ff2, st_);
+            }
+            for (int c = 0; c < kClasses; ++c) {
+                if (!by_tab[c]) continue;
+                for (int g0 = c0[c]; g0 < c0[c + 1]; g0 += Mmq::kTab) {
+                    const int m = std::min(Mmq::kTab, c0[c + 1] - g0);
+                    const void* tab[Mmq::kTab];
+                    int most = 0;
+                    for (int k = 0; k < m; ++k) {
+                        tab[k] = L.slot[(size_t) group_[(size_t) (g0 + k)]] + (down ? gu2 : 0);
+                        most = std::max(most, rows_of(g0 + k));
+                    }
+                    const bool launched =
+                        down ? mmq_->mul_tab(tab, dt, n_embd_, ff, m, mq2_, d_bounds + g0, d_place, rc, most, dx_,
+                                             n_embd_, st_)
+                             : mmq_->mul_tab(tab, gt, ff2, n_embd_, m, mq_, d_bounds + g0, iota_, rg, most, gu_, ff2,
+                                             st_);
+                    if (!launched) throw std::runtime_error("mmq: no pointer-table launch for the cached experts");
+                }
+            }
+        };
+        cached(false);
         if (rc > 0) {
             if (gelu_) geglu_rows(gu_, hx_, n_ff_exp_, rc, st_);
             else swiglu_clamp_rows(gu_, hx_, n_ff_exp_, rc, limit, st_);
             Mmq::quantize(hx_, nullptr, mq2_, dt, ff, ff, rc, st_);
         }
-        for (const Run& r : runs_)
-            mmq_->mul(slot_of(r.j) + gu2, dt, n_embd_, ff, L.slot_bytes, r.m, mq2_, d_cb + (size_t) r.c * cb_row + r.j,
-                      d_place, rc, r.most, dx_, n_embd_, st_);
+        cached(true);
 
         // The round the buffer holds goes first and is not copied.  If it holds none of this call's, the experts
         // that go ahead are copied last, so the next call finds them.  The order does not change a round's launches.
@@ -2556,7 +2653,19 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             } else if (r == 0 && early) {
                 ck(cudaStreamWaitEvent(cs(st_), (cudaEvent_t) ev_ahead_, 0), "expert staging");
             } else if (rows > 0) {
-                stage(L, group_.data() + g0, m, st_, n_cpu > 0);
+                // an answer's window: the four stagers copy, so the expert workers sleep instead of spinning
+                if (answer && !stagers_) stagers_ = std::make_unique<Workers>(4);
+                if (n_round == 1 && opt_.stage_overlap) {
+                    // One round: its copy goes on the upload stream, under the cached experts' kernels queued
+                    // above, and the compute stream takes it up when it lands.  More rounds reuse the buffer, so
+                    // a round's copy has to follow the round before it on the compute stream.
+                    ck(cudaStreamWaitEvent(cs(up_), (cudaEvent_t) ev_free_, 0), "expert staging");
+                    stage(L, group_.data() + g0, m, up_, n_cpu > 0 || answer);
+                    ck(cudaEventRecord((cudaEvent_t) ev_ahead_, cs(up_)), "expert staging");
+                    ck(cudaStreamWaitEvent(cs(st_), (cudaEvent_t) ev_ahead_, 0), "expert staging");
+                } else {
+                    stage(L, group_.data() + g0, m, st_, n_cpu > 0 || answer);
+                }
                 holds = r;
             }
             if (rows == 0) continue;   // nothing routed to the experts that go ahead
@@ -2732,7 +2841,11 @@ void Engine::run(const int32_t* tokens, int n) {
     //
     // A half's launches are the ones its tokens have in a call of their own, at their rows of the buffers
     // (shift_rows()), so each token comes out as it would alone.
-    if (n > 1 && windowed_ && !all_cached() && halves_) {
+    // With --stage-rows under kStageRows a window's experts take the batch path (moe_rows(), below), whose call
+    // does the shared expert and the routing itself: up() leaves them out, and moe() would then miss them, so
+    // the halves (which call moe() directly) are not for such a window.
+    const bool streamed = mmq_ && n >= opt_.stage_rows && opt_.stage_rows < kStageRows;
+    if (n > 1 && windowed_ && !all_cached() && halves_ && !streamed) {
         const int first[3] = {0, (n + 1) / 2, n};   // half k is the tokens [first[k], first[k + 1])
         const unsigned bits = snap_bits_;           // the window's tokens that leave the recurrent state
         int at = 0;
