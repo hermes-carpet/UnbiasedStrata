@@ -27,22 +27,51 @@ die() { echo "error: $*" >&2; exit 1; }
 
 command -v nvidia-smi >/dev/null || die "nvidia-smi not found (no NVIDIA driver?)"
 
-# --- CUDA toolkit: version and source --------------------------------------------------
-# With a toolkit on the box: build against exactly that nvcc release. Without one (driver
-# only): the newest toolkit NVIDIA's apt repo has for this distro that the driver can run;
-# the box then uses the -cudalibs package (CUDA runtime libs bundled).
+# --- CUDA: version and source ------------------------------------------------------------
+# CUDA_ON_TARGET says whether the slim package runs here: the box's loader finds libcudart,
+# libcublas and libcublasLt (a runtime-only install like cuda-cudart-X-Y + libcublas-X-Y is
+# enough; nvcc is not needed). The version CI builds with, in order:
+#   nvcc on the box          exactly that release
+#   CUDA runtime on the box  its X.Y (same sonames, no newer runtime API than it has)
+#   driver only              the newest X.Y in NVIDIA's apt repo the driver can run; the box
+#                            then uses the -cudalibs package (CUDA runtime libs bundled)
+ldc=$(command -v ldconfig || echo /sbin/ldconfig)   # not on a normal user's PATH on Debian
+ldcache=$("$ldc" -p 2>/dev/null || true)
+# newest libcudart.so.N the loader knows; its real file name carries the full version
+rt_lib=$(grep -oE '/[^ ]*/libcudart\.so\.[0-9]+$' <<<"$ldcache" | while read -r l; do readlink -f "$l"; done \
+  | grep -E 'libcudart\.so\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+rt_ver=$(grep -oE 'so\.[0-9]+\.[0-9]+' <<<"$rt_lib" | cut -d. -f2,3 || true)
+rt_major=${rt_ver%%.*}
+CUDA_ON_TARGET=no
+if [ -n "$rt_ver" ]; then
+  if grep -q "libcublas\.so\.${rt_major} " <<<"$ldcache" && grep -q "libcublasLt\.so\.${rt_major} " <<<"$ldcache"; then
+    CUDA_ON_TARGET=yes
+  elif [ -e "${rt_lib%/*}/libcublas.so.${rt_major}" ] && [ -e "${rt_lib%/*}/libcublasLt.so.${rt_major}" ]; then
+    # NVIDIA's libcublas-X-Y does not refresh the loader cache when installed after cuda-cudart-X-Y
+    CUDA_ON_TARGET=yes
+    echo "WARNING: libcublas .so.${rt_major} is installed in ${rt_lib%/*} but the loader cache does not list it yet: run 'sudo ldconfig', or the slim package fails to start (libcublas.so.${rt_major}: cannot open shared object file)" >&2
+  else
+    echo "note: CUDA runtime ${rt_ver} is installed but libcublas/libcublasLt .so.${rt_major} are not on the loader path (install libcublas-${rt_ver/./-}, or use the -cudalibs package)" >&2
+  fi
+fi
 NVCC=$(command -v nvcc || true)
 [ -n "$NVCC" ] || for p in /usr/local/cuda/bin/nvcc /usr/local/cuda-*/bin/nvcc; do [ -x "$p" ] && NVCC=$p && break; done
 if [ -n "$NVCC" ]; then
-  CUDA_ON_TARGET=yes
   CUDA_VERSION=$("$NVCC" --version | sed -nE 's/.*, V([0-9.]+)$/\1/p')
   real_nvcc=$(readlink -f "$NVCC")
   if dpkg -S "$real_nvcc" 2>/dev/null | grep -q '^nvidia-cuda-toolkit'; then CUDA_SOURCE=debian-apt
   elif dpkg -S "$real_nvcc" 2>/dev/null | grep -q '^cuda-nvcc'; then CUDA_SOURCE=nvidia-repo
   else CUDA_SOURCE=nvidia-repo; echo "note: nvcc ($real_nvcc) is not from a .deb (runfile install?); CI will use NVIDIA's apt repo for ${CUDA_VERSION}" >&2
   fi
+  [ -z "$rt_ver" ] || [ "${CUDA_VERSION%.*}" = "$rt_ver" ] \
+    || echo "note: nvcc is ${CUDA_VERSION} but the loader finds CUDA runtime ${rt_ver}; the build follows nvcc" >&2
+elif [ -n "$rt_ver" ]; then
+  CUDA_VERSION=$rt_ver
+  # Debian's own runtime (libcudart12) vs NVIDIA's (cuda-cudart-X-Y, also what extrepo's nvidia-cuda gives)
+  if dpkg -S "$rt_lib" 2>/dev/null | grep -q '^libcudart'; then CUDA_SOURCE=debian-apt; else CUDA_SOURCE=nvidia-repo; fi
+  echo "note: no nvcc on this box; CI will build with CUDA ${CUDA_VERSION} to match its runtime (${rt_lib})" >&2
 else
-  CUDA_ON_TARGET=no CUDA_SOURCE=nvidia-repo
+  CUDA_SOURCE=nvidia-repo
   drv_cuda=$(nvidia-smi -q | sed -nE 's/^ *CUDA (UMD )?Version *: *([0-9]+\.[0-9]+).*/\2/p' | tail -1)
   [ -n "$drv_cuda" ] || die "no nvcc, and nvidia-smi does not report the driver's CUDA version"
   repo="${ID}$(echo "$VERSION_ID" | tr -d .)"
