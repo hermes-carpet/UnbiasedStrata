@@ -139,9 +139,17 @@ CPU_FLAGS='$CPU_FLAGS'
 EOF
 echo "=== profile for target '$TNAME' ==="; cat "$profile"; echo
 
-# CUDA 12.4 needs driver >= 550.54.14 on Linux (550.x is what 12.4 shipped with)
+# the driver has to run what CI builds: CUDA X.y binaries need at least the X.0 driver branch
+# (minor-version compatibility). Checked here only; the driver version is never published.
 drv_major=${DRIVER%%.*}
-[ "${CUDA_VERSION%%.*}" != 12 ] || [ "$drv_major" -ge 525 ] || echo "WARNING: driver $DRIVER is older than CUDA 12.x minimum compatibility (525)" >&2
+case "${CUDA_VERSION%%.*}" in 12) drv_min=525 ;; 13) drv_min=580 ;; *) drv_min="" ;; esac
+if [ -z "$drv_min" ]; then
+  echo "note: no known minimum driver for CUDA ${CUDA_VERSION}; driver ${DRIVER} not checked" >&2
+elif [ "$drv_major" -ge "$drv_min" ]; then
+  echo "driver ${DRIVER}: ok for CUDA ${CUDA_VERSION} (needs >= ${drv_min})"
+else
+  die "driver ${DRIVER} cannot run CUDA ${CUDA_VERSION} binaries (needs >= ${drv_min}); upgrade the driver first"
+fi
 
 [ "$DRY" = 0 ] || { echo "(dry run: nothing pushed)"; exit 0; }
 
