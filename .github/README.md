@@ -55,7 +55,7 @@ gcc does not know rather than the whole list, and notes it in `BUILDINFO.txt`.
 
 | File | Use |
 |---|---|
-| `unbiased-strata-<label>-<target>.tar.gz` | links the target's installed CUDA runtime (`libcudart.so.12`, `libcublas*.so.12`) |
+| `unbiased-strata-<label>-<target>.tar.gz` | links the target's installed CUDA runtime (`libcudart`, `libcublas*` of its CUDA major) |
 | `unbiased-strata-<label>-<target>-cudalibs.tar.gz` | same, plus those libs in `bin/lib` (needs only the NVIDIA driver) |
 
 `BUILDINFO.txt` inside each has the target profile, the exact flags and the CI check results.
