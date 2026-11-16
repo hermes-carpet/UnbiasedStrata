@@ -10,7 +10,7 @@
 # name defaults to <gpu>-<distro> (e.g. 3090-debian13). The repo is PUBLIC, so the profile holds
 # only what the build needs: no hostname, kernel, driver version, CPU model string or GPU count.
 # --cpu sets how much of the CPU it publishes (the full flag list pins down the CPU generation):
-#   level  (default) the x86-64 level only (x86-64-v3 / -v4)
+#   level  the x86-64 level only (x86-64-v3 / -v4)
 #   ggml   the level + the extensions ggml-cpu has code paths for (VNNI, BF16, VBMI, AMX)
 #   native everything gcc resolves for -march=native (what `make build` on the box would use)
 # Needs `gh` signed in as hermes-carpet (`gh auth login`), or
@@ -18,7 +18,7 @@
 set -euo pipefail
 
 REPO=hermes-carpet/UnbiasedStrata
-TNAME=""; DRY=0 CPU_MODE=level
+TNAME=""; DRY=0 CPU_MODE=ggml
 for a in "$@"; do case "$a" in --dry-run) DRY=1 ;; --cpu=*) CPU_MODE=${a#--cpu=} ;; *) TNAME=$a ;; esac; done
 die() { echo "error: $*" >&2; exit 1; }
 

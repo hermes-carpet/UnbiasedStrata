@@ -44,7 +44,7 @@ not fit in VRAM, is compiled for). GPU kernels are the same in all three:
 
 | `--cpu=` | publishes | CPU code |
 |---|---|---|
-| `level` (default) | the x86-64 level (`x86-64-v3`, `-v4` on AVX-512 boxes) | no VNNI/BF16 dot products, generic tuning |
+| `level` | the x86-64 level (`x86-64-v3`, `-v4` on AVX-512 boxes) | no VNNI/BF16 dot products, generic tuning |
 | `ggml` | the level + the extensions ggml-cpu has code paths for (VNNI, BF16, VBMI, AMX) | all of ggml's fast paths, generic tuning |
 | `native` | everything gcc resolves for `-march=native` (pins down the CPU generation) | what `make build` on the box gives |
 
