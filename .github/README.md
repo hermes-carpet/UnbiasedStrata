@@ -29,7 +29,7 @@ Upstream's own README is [`/README.md`](../README.md).
 
 ## Add or refresh a target
 
-On the target machine, signed in to `gh` as hermes-carpet (`sudo apt install gh && gh auth login`):
+On the target machine, signed in to `gh` with push access to this repo (`sudo apt install gh && gh auth login`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hermes-carpet/UnbiasedStrata/main/.github/scripts/scrape-target.sh | bash -s -- 3090-debian13

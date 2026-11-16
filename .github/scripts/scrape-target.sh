@@ -13,7 +13,7 @@
 #   level  the x86-64 level only (x86-64-v3 / -v4)
 #   ggml   the level + the extensions ggml-cpu has code paths for (VNNI, BF16, VBMI, AMX)
 #   native everything gcc resolves for -march=native (what `make build` on the box would use)
-# Needs `gh` signed in as hermes-carpet (`gh auth login`), or
+# Needs `gh` signed in with push access to the repo (`gh auth login`), or
 # GH_TOKEN set. Writes nothing to disk except a temp file under /tmp.
 set -euo pipefail
 
@@ -183,9 +183,7 @@ fi
 [ "$DRY" = 0 ] || { echo "(dry run: nothing pushed)"; exit 0; }
 
 command -v gh >/dev/null || die "gh not installed: sudo apt install gh && gh auth login"
-gh auth status >/dev/null 2>&1 || [ -n "${GH_TOKEN:-}" ] || die "gh is not signed in: gh auth login (as hermes-carpet)"
-who=$(gh api user --jq .login)
-[ "$who" = hermes-carpet ] || echo "note: signed in as $who, not hermes-carpet" >&2
+gh auth status >/dev/null 2>&1 || [ -n "${GH_TOKEN:-}" ] || die "gh is not signed in: gh auth login"
 
 path=".github/targets/${TNAME}.env"
 old_sha=$(gh api "repos/$REPO/contents/$path" --jq .sha 2>/dev/null || true)
